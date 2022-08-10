@@ -1,0 +1,147 @@
+= SWIM Protocol Library
+
+
+== Глоссарий 
+
+* _Gossip_ протокол, который решает проблему обнаружения событий в кластере и распространения событий в кластере;
+
+
+* _Пинг_ - регулярная посылка UDP-сообщений, каждые 300 мс, для проверки доступности узла;
+
+* _Прямой пинг_ - _пинг_  непосредственно получателю;
+
+* _Подозрительный узел_ - узел который не ответил на _прямой пинг_ сообщением ack хотя бы 2 раза.
+
+* _Непрямой пинг_ - взять случайный узел и попросить сделать _пинг_ на _подозрительный_ узел.
+
+* _Мертвый узел_ - _подозрительный узел_ который не ответил на _непрямой пинг_ хотя бы 2 раза.
+
+* _Свой пинг_ - если послал всем пинг и ни от кого не пришел ответ, то скорее всего проблемы с отправителем.
+
+* _Piggybacking_ - техника, когда в _пинг_ сообщение подселяются другие сообщения кластера.
+
+* _Событие кластера_ – новый узел (joining), нормальный узел (normal), подозрительный узел (suspicious), мертвый узел (dead), выход из кластера узла (leave), изменение инкарнации.
+
+* _Инкарнация_ – механизм опровержения слухов. Реализован в виде персонального счетчика узла. Этот счетчик может увеличивать только этот узел. Каждое сообщение _пинг_, которое уходит из узла, содержит значение этого счетчика. 
+Счетчик представляет собой пару [число перезагрузок узла, число сообщений отправленных этим узлом после перезагрузки]
+
+==  Структура сообщения
+
+[source,clojure]
+.event-struct.clj
+----
+
+;; вход в кластер
+[
+    ;; запрос входящего узла в кластер
+    [:ping :this-uuid :this-restart-counter :this-tx-counter :other-uuid]
+    [:joining :this-uuid :this-restart-counter :this-tx-counter :this-host :this-port]
+]
+
+[
+    ;; ответ входящему узлу содержит только 2 сообщения
+    [:ack :this-uuid :this-restart-counter :this-tx-counter :other-uuid :other-tx-counter]
+    [:joining :other-uuid :other-restart-counter :other-tx-counter :other-host :other-port] ;; это же соообщение рассылается остальным узлам кластера
+    ;; + антиэнтропия: случайное подмножество живых узлов
+    [{:host "" :port 123 :uuid 987654 :restart-counter 1 :tx-counter 2}
+     {:host "" :port 456 :uuid 435877 :restart-counter 5 :tx-counter 8}]
+]
+
+[
+    ;; запрос входящего узла в кластер
+    [:ping :this-uuid :this-restart-counter :this-tx-counter :other-uuid]
+    [:normal :this-uuid]
+]
+
+[
+    ;; ответ
+    [:ack :this-uuid :this-restart-counter :this-tx-counter :other-uuid :other-tx-counter]
+    ;;.. какие-то сообщения в кластере
+    [:normal :other-uuid]
+    ;; + другие сообщения в кластере
+    ;; + антиэнтропия: случайное подмножество живых узлов
+    [:anti-entropy 
+      {:host "" :port 123 :uuid 987654 :restart-counter 1 :tx-counter 2}
+      {:host "" :port 456 :uuid 435877 :restart-counter 5 :tx-counter 8}]
+
+]
+
+;; конец входа в кластер
+
+;; в случае просроченной инкарнации 
+
+[
+    ;; ответ
+    [:ack :this-uuid :this-restart-counter :this-tx-counter :other-uuid :other-tx-counter]
+    [:dead :other-uuid :other-restart-counter :other-tx-counter] ;; тут передаются последние запомненные значения
+   
+]
+
+;; нормальная работа кластера
+[
+    ;; запрос
+    [:ping :this-uuid :this-restart-counter :this-tx-counter :other-uuid]
+    [:normal :some3-other-uuid]
+    [:joining :some-other-uuid :some-other-restart-counter :some-other-tx-counter :some-other-host :some-other-port]
+    [:suspicious :some4-other-uuid]
+    ;; + антиэнтропия: случайное подмножество живых узлов
+    [:anti-entropy 
+      {:host "" :port 123 :uuid 987654 :restart-counter 1 :tx-counter 2}
+      {:host "" :port 456 :uuid 435877 :restart-counter 5 :tx-counter 8}]
+    [:payload {:some :data}] ;; payload принадлежит отправителю и закрепляется в таблице соседей за отправителем
+]
+
+[
+    ;; ответ
+    [:ack :this-uuid :this-restart-counter :this-tx-counter :other-uuid :other-tx-counter]
+    [:normal :some5-other-uuid]
+    [:dead :some7-other-uuid]
+    ;; + антиэнтропия: случайное подмножество живых узлов
+    [:anti-entropy 
+      {:host "" :port 123 :uuid 987654 :restart-counter 1 :tx-counter 2}
+      {:host "" :port 456 :uuid 435877 :restart-counter 5 :tx-counter 8}]
+]
+
+
+----
+
+
+
+
+[ping-ack, this-uuid, this-restart-counter, this-tx-counter, other-uuid]
+[dead, some4-other-uuid]
+
+
+== Работа 
+
+Как только событие пришло, оно сразу начинает распространяться без ожиданий.
+
+Каждый узел держит табличку всех известных ему узлов кластера и их состоянии и обновляет таблицу из сообщений кластера.
+
+Все события, которые вырабатывает узел или о которых он узнаёт, складываются в очередь.
+
+В этой очереди для каждого узла хранится последнее состояние. Если пришло 5 событий про какой-то узел, тот в очереди будет храниться последнее состояние этого узла.
+
+Каждое событие посылается logN узлам.
+
+При приеме сообщений каждый узел проверяет инкарнацию отправителя и если она меньше чем известно получателю, то такие пакеты не принимаются и считаются пришедшими из прошлого.
+
+Для равномерного и честного распределения сообщений вводятся раунды. В начале каждого раунда формируется вектор из перемешанных по порядку идентификаторов живых узлов. Далее из вектора выбираются N идентификаторов узлов, которым посылаются сообщения. Когда вектор пуст раунд заканчивается. Начинается новый раунд рассылки сообщений. Это сделано для того, чтобы каждому узлу посылалось одинаковое количество пакетов.
+
+При изменении инкарнации числа рестарта, payload считается устаревшим 
+
+:heartbeat-rate-ms 200
+
+.Команды: 
+* add-node({:uuid, :host, :port,..})  
+* remove-node(uuid), 
+* probe-node(host, port), 
+* cluster-size() - размер кластера, 
+* node-info(uuid)
+* on-node-event(uuid,event-type)
+* on-cluster-event(event-type)
+* leave(node)
+* set-payload({:some :data})
+
+
+
